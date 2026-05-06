@@ -1,8 +1,10 @@
-FROM runpod/base:0.6.2-cuda12.4.1
+FROM runpod/base:1.0.3-cuda1281-ubuntu2204
 
 WORKDIR /workspace
 
-# System deps for video encode + git for cloning LTX-2
+# System deps for video encode + git for cloning LTX-2.
+# (ffmpeg + libgl1 are already in the base image but we re-declare so
+# this Dockerfile is portable to other bases.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1 \
@@ -11,75 +13,67 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
-# uv is the LTX-2 repo's recommended package manager — significantly
-# faster than pip for the heavy deps (torch, transformers, etc.).
-RUN python -m pip install --upgrade pip uv
+# The runpod/base image uses `python3` (not `python`) — the previous
+# Dockerfile failed at exit 127 because the venv-style `python` symlink
+# isn't there. Make a tiny wrapper alias-script for any tooling that
+# expects the bare name (LTX-2's optional `uv sync` invokes `python`),
+# then use `python3` explicitly elsewhere for clarity.
+RUN ln -sf "$(which python3)" /usr/local/bin/python
+
+# Latest pip (the base ships an older one) — kept minimal: no `uv` here.
+# `uv sync --frozen` from LTX-2's docs is for a dev env; we install
+# `ltx-core` + `ltx-pipelines` editable via plain pip below, which is
+# what RunPod's serverless runtime actually needs.
+RUN python3 -m pip install --upgrade pip
 
 # Clone LTX-2 and install the ltx-pipelines + ltx-core packages from
-# source. Pinned to a known-good commit; bump after testing a newer
-# release. The two `pip install -e` lines avoid `uv sync` here so the
-# image only carries inference deps (no dev/test extras).
+# source. Pinned to `main`; bump LTX2_REF after testing a newer tag.
 ARG LTX2_REF=main
 RUN git clone --depth 1 --branch ${LTX2_REF} https://github.com/Lightricks/LTX-2.git /workspace/LTX-2 \
     && cd /workspace/LTX-2 \
-    && pip install --no-cache-dir -e packages/ltx-core \
-    && pip install --no-cache-dir -e packages/ltx-pipelines
+    && python3 -m pip install --no-cache-dir -e packages/ltx-core \
+    && python3 -m pip install --no-cache-dir -e packages/ltx-pipelines
 
-# Worker SDK + a few utilities the handler needs
+# Worker SDK + the few utilities the handler imports directly.
 COPY requirements.txt /workspace/requirements.txt
-RUN pip install --no-cache-dir -r /workspace/requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /workspace/requirements.txt
 
 # ─── Pre-download checkpoints into the image ────────────────────────────
-# Baking weights into the image avoids paying ~50GB of HF Hub
-# bandwidth on every cold boot. Comment these out for faster image
-# rebuilds during dev — the first job will fall back to a runtime
-# download (slower first call, same total cost).
+# Bake the ~47GB of weights into the image at build time so cold-starts
+# don't pay the HF Hub bandwidth on every worker boot. Done in three
+# separate RUN steps so each download has its own layer — if one fails
+# (e.g. transient HF rate-limit) the build can resume from the next
+# layer instead of redoing the entire fetch.
 #
-# Three artefacts:
-#   1. LTX-2.3 distilled-1.1 base checkpoint (~44GB bf16)
-#   2. Spatial upscaler ×2 1.1 (~1GB)
-#   3. Gemma text encoder
-#
-# `--include` patterns keep us from pulling the whole 22B repo when
-# we only need the merged distilled-1.1 safetensors + tokenizer.
+# Lightricks/LTX-2.3 is *public* (verified via HF API), so the LTX
+# downloads need no token. Only Gemma is gated → see step 3.
+
 RUN mkdir -p /workspace/models /workspace/models/gemma
 
 ARG LTX_REPO=Lightricks/LTX-2.3
-ARG GEMMA_REPO=google/gemma-3-1b-pt
-ARG HF_TOKEN=""
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
-RUN python - <<'PY'
-import os
-from huggingface_hub import hf_hub_download, snapshot_download
-token = os.environ.get("HF_TOKEN") or None
+# 1. LTX-2.3 22B distilled-1.1 base checkpoint (~44GB)
+RUN python3 -c "from huggingface_hub import hf_hub_download; \
+hf_hub_download(repo_id='${LTX_REPO}', filename='ltx-2.3-22b-distilled-1.1.safetensors', local_dir='/workspace/models')"
 
-# Distilled-1.1 — single merged safetensors. The repo lists this as
-# `ltx-2.3-22b-distilled-1.1.safetensors` at the root.
-hf_hub_download(
-    repo_id=os.environ.get("LTX_REPO", "Lightricks/LTX-2.3"),
-    filename="ltx-2.3-22b-distilled-1.1.safetensors",
-    local_dir="/workspace/models",
-    token=token,
-)
+# 2. Spatial upscaler ×2 v1.1 (~1GB)
+RUN python3 -c "from huggingface_hub import hf_hub_download; \
+hf_hub_download(repo_id='${LTX_REPO}', filename='ltx-2.3-spatial-upscaler-x2-1.1.safetensors', local_dir='/workspace/models')"
 
-# Spatial upscaler ×2 v1.1
-hf_hub_download(
-    repo_id=os.environ.get("LTX_REPO", "Lightricks/LTX-2.3"),
-    filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-    local_dir="/workspace/models",
-    token=token,
-)
-
-# Gemma text encoder — LTX-2.3 expects a local path to a Gemma model
-# directory containing model weights + tokenizer. gemma-3-1b-pt is
-# the smallest variant compatible with LTX-2's gated text connector.
-snapshot_download(
-    repo_id=os.environ.get("GEMMA_REPO", "google/gemma-3-1b-pt"),
-    local_dir="/workspace/models/gemma",
-    token=token,
-)
-PY
+# 3. Gemma 3 1B text encoder (~2GB) — GATED on HuggingFace.
+#    Pass HF_TOKEN as a Docker build arg (RunPod console → endpoint
+#    settings → Container env). If unset we skip — handler will
+#    download lazily on first job using a runtime-injected HF_TOKEN.
+ARG HF_TOKEN=""
+ENV HF_TOKEN=$HF_TOKEN
+ARG GEMMA_REPO=google/gemma-3-1b-pt
+RUN if [ -n "$HF_TOKEN" ]; then \
+        python3 -c "import os; from huggingface_hub import snapshot_download; \
+snapshot_download(repo_id='${GEMMA_REPO}', local_dir='/workspace/models/gemma', token=os.environ['HF_TOKEN'])"; \
+    else \
+        echo "⚠️  HF_TOKEN not set at build time — Gemma will be downloaded lazily on first job. Set HF_TOKEN as a build env var to bake it into the image."; \
+    fi
 
 COPY handler.py /workspace/handler.py
 
@@ -91,4 +85,4 @@ ENV LTX_CHECKPOINT_PATH=/workspace/models/ltx-2.3-22b-distilled-1.1.safetensors 
     LTX_GEMMA_ROOT=/workspace/models/gemma \
     LTX_DISTILLED_LORA_PATH=""
 
-CMD ["python", "-u", "/workspace/handler.py"]
+CMD ["python3", "-u", "/workspace/handler.py"]
