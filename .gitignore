@@ -1,0 +1,18 @@
+# Python build / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Local model cache (operators sometimes stage weights here for testing)
+models/
+*.safetensors
+*.bin
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

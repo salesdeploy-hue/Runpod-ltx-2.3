@@ -1,0 +1,20 @@
+# Worker SDK
+runpod>=1.7.0
+
+# LTX-2 native pipeline deps. The ltx-pipelines + ltx-core packages
+# are installed editable from the cloned LTX-2 repo in the Dockerfile;
+# below are the supporting libs the handler imports directly.
+torch==2.4.1
+torchvision==0.19.1
+transformers>=4.50.0
+accelerate>=1.0.0
+huggingface_hub>=0.26.0
+hf_transfer>=0.1.8
+sentencepiece>=0.2.0
+Pillow>=10.4.0
+numpy<2.0
+
+# safetensors / einops are LTX-2 transitive deps but we pin them
+# explicitly to avoid a noisy "satisfiable" message on each build.
+safetensors>=0.4.5
+einops>=0.8.0
