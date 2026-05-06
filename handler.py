@@ -47,6 +47,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import runpod  # type: ignore
 import torch  # type: ignore
 
 
@@ -297,6 +298,10 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-if __name__ == "__main__":
-    import runpod  # type: ignore
-    runpod.serverless.start({"handler": handler})
+# Module-level entrypoint — RunPod's GitHub deploy scanner greps the
+# default branch for `runpod.serverless.start(` at top-level scope to
+# auto-detect the worker's entry point. Wrapping this call in
+# `if __name__ == "__main__":` defeats that scan and triggers the
+# "Could not find runpod.serverless.start() in your default branch"
+# error on the New Endpoint page.
+runpod.serverless.start({"handler": handler})
