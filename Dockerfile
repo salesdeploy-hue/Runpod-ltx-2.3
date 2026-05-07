@@ -1,67 +1,74 @@
-# AdsXFlow LTX-2.3 RunPod Serverless worker.
+# AdsXFlow LTX-2.3 RunPod Serverless worker — ComfyUI-based.
 #
-# Versions pinned to MATCH Lightricks/LTX-2's uv.lock exactly. Each
-# loose pin we tried previously drifted past their tested set and
-# broke at runtime (SiglipVisionModel API drift in transformers >=4.55,
-# accelerate API changes, etc.).
+# Why ComfyUI vs the native ltx_pipelines path:
+#   - ComfyUI's memory manager actually offloads Gemma + idle layers
+#     between transformer blocks. Native ltx_pipelines pinned both
+#     the LTX 22B AND the Gemma 12B in VRAM at all times → 138 GB
+#     OOMs even on H200 (140 GB) at our render params.
+#   - ComfyUI fits LTX-2.3 22B on **32 GB GPUs** (per Lightricks'
+#     ComfyUI-LTXVideo README). RTX 5090 / L40S / A100 are all in.
+#   - Workflow JSON exposes every LTX param (resolution, frames,
+#     fp8, LoRA, IC-LoRA, etc.) without us hand-coding a handler
+#     for each variant.
+#
+# Strategy: layer LTX-2.3 ComfyUI nodes + weights on top of RunPod's
+# published worker-comfyui base. The base provides ComfyUI itself
+# plus the runpod handler that polls the prediction queue.
 
-FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+FROM runpod/worker-comfyui:5.8.5-base-cuda12.8.1
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    TZ=Etc/UTC \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-        git-lfs \
-        ffmpeg \
-        curl \
-        libsm6 \
-        libxext6 \
-        libgl1 \
-        build-essential \
-    && git lfs install \
-    && rm -rf /var/lib/apt/lists/*
+# ─── Install Lightricks/ComfyUI-LTXVideo custom nodes ──────────────────────
+# These are the official LTX-Video / LTX-2.3 nodes from Lightricks.
+# `comfy-node-install` is provided by the base image.
+RUN comfy-node-install ComfyUI-LTXVideo
 
-# runpod/base ships only `python3`; LTX-2 packages invoke `python`
-# in some build paths.
-RUN ln -sf "$(which python3)" /usr/local/bin/python
+# Some LTX-2.3 nodes need extra Python deps (av, openimageio, etc.)
+# beyond what the base image ships. Install into ComfyUI's venv.
+RUN /opt/venv/bin/pip install --no-cache-dir \
+    "av>=13.0.0" \
+    "imageio[ffmpeg]>=2.36.0" \
+    "imageio-ffmpeg>=0.5.1" \
+    "huggingface_hub>=0.26.0"
 
-WORKDIR /workspace
+# ─── Pre-download LTX-2.3 model weights ────────────────────────────────────
+# Bake the weights into the image so cold starts don't pay the
+# HuggingFace bandwidth on every worker boot. Going with the FP8
+# variant (~27 GB) instead of the full bf16 (~44 GB) — matches
+# what Lightricks/ComfyUI-LTXVideo expects for the 32 GB-GPU floor,
+# and ComfyUI's loader handles fp8 weights natively.
+ARG HF_TOKEN=""
+ENV HF_TOKEN=${HF_TOKEN}
 
-RUN pip install --upgrade pip setuptools wheel
+RUN mkdir -p /comfyui/models/checkpoints \
+             /comfyui/models/vae \
+             /comfyui/models/text_encoders \
+             /comfyui/models/upscale_models
 
-# CRITICAL ORDER:
-# 1. Install our pinned requirements FIRST. These match Lightricks'
-#    uv.lock exactly so the LTX-2 install step (next) sees its deps
-#    already satisfied and doesn't re-resolve to newer breaking
-#    versions.
-COPY requirements.txt /workspace/requirements.txt
-RUN pip install --no-cache-dir -r /workspace/requirements.txt
+# 1. LTX-2.3 distilled fp8 (~27 GB). The "distilled-fp8" variant runs
+#    in 8 inference steps with CFG=1, fits 32 GB GPUs.
+RUN /opt/venv/bin/python -c "from huggingface_hub import hf_hub_download; \
+hf_hub_download(repo_id='Lightricks/LTX-2.3-fp8', \
+                filename='ltx-2.3-22b-distilled-fp8.safetensors', \
+                local_dir='/comfyui/models/checkpoints')"
 
-# 2. Now install LTX-2 packages. Use --no-deps because every dep is
-#    already pinned in step 1; --no-deps prevents pip's resolver from
-#    yanking transformers/accelerate/etc to newer versions.
-ARG LTX2_REF=main
-RUN git clone --depth 1 --branch ${LTX2_REF} https://github.com/Lightricks/LTX-2.git /workspace/LTX-2 \
-    && cd /workspace/LTX-2 \
-    && pip install --no-cache-dir --no-deps -e packages/ltx-core \
-    && pip install --no-cache-dir --no-deps -e packages/ltx-pipelines
+# 2. Spatial upscaler ×2 v1.1 (~1 GB) — used by the two-stage workflow
+#    to bring the half-res stage_1 output up to full res.
+RUN /opt/venv/bin/python -c "from huggingface_hub import hf_hub_download; \
+hf_hub_download(repo_id='Lightricks/LTX-2.3', \
+                filename='ltx-2.3-spatial-upscaler-x2-1.1.safetensors', \
+                local_dir='/comfyui/models/upscale_models')"
 
-COPY handler.py /workspace/handler.py
+# 3. Gemma 3 12B text encoder (~22.7 GB) — Lightricks' open variant
+#    with the multimodal preprocessor_config.json. Lands at the path
+#    the LTX-2.3 nodes expect.
+RUN /opt/venv/bin/python -c "from huggingface_hub import snapshot_download; \
+snapshot_download(repo_id='Lightricks/gemma-3-12b-it-qat-q4_0-unquantized', \
+                  local_dir='/comfyui/models/text_encoders/gemma-3-12b')"
 
-ENV LTX_MODELS_ROOT=/workspace/models \
-    LTX_FALLBACK_MODELS_ROOT=/workspace/models \
-    LTX_REPO=Lightricks/LTX-2.3 \
-    GEMMA_REPO=Lightricks/gemma-3-12b-it-qat-q4_0-unquantized \
+# Worker-side env vars. ComfyUI-Manager's network mode is set on
+# container start by the base image's startup script; we just add
+# our knobs.
+ENV REFRESH_WORKER=false \
     HF_HUB_ENABLE_HF_TRANSFER=0
-
-EXPOSE 5000
-
-# Healthcheck verifies CUDA + transformers are importable. If either
-# breaks the rolling update never completes — fail fast, not silent.
-HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=180s \
-    CMD python -c "import torch, transformers; assert torch.cuda.is_available()" || exit 1
-
-CMD ["python", "-u", "/workspace/handler.py"]

@@ -1,38 +1,28 @@
-# VCS / cache
 .git/
 .gitignore
+.runpod/
+workflows/
+README.md
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Python noise
 __pycache__/
 *.py[cod]
 *.egg-info/
-.cache/
-.DS_Store
 .venv/
 venv/
 .pytest_cache/
 
-# RunPod metadata (read by deploy, not needed inside image)
-.runpod/
-
-# Local model staging — never bake weights into the image
+# No local model staging
 models/
 weights/
-checkpoints/
 *.safetensors
 *.bin
 *.ckpt
-
-# Large media junk
-*.mp4
-*.mov
-*.avi
-*.jpg
-*.jpeg
-*.png
-*.gif
-
-# Local docs / IDE
-README.md
-README_zh.md
-.idea/
-.vscode/
-*.swp
+*.pt
+*.pth

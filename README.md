@@ -1,108 +1,71 @@
-# RunPod LTX-2.3 Worker — AdsXFlow Reference
+# AdsXFlow LTX-2.3 ComfyUI Worker
 
-Drop-in **RunPod Serverless** worker that AdsXFlow's
-`ltx_video_provider` talks to. Renders **a single MP4 with
-synchronized audio** (LTX-2.3 is the first DiT-based audio-video
-foundation model — no separate VO step needed).
+RunPod Serverless worker for **Lightricks LTX-2.3** built on the
+**ComfyUI** runtime — the same stack the LTX community uses to fit
+22B params on 32 GB GPUs.
 
-> ⚙️  **Serverless, not Pods.** Workers spin up on the first /run,
-> idle out after 30s, and scale back to zero. **You only pay for
-> seconds of inference** — there's no idle storage or always-on
-> compute bill. RunPod handles the lifecycle.
+This replaces the previous native `ltx_pipelines` handler approach,
+which kept the LTX 22B + Gemma 12B both pinned in VRAM and OOMed
+even on H200 (140 GB).
+
+## What's inside
+
+| Layer | Provider |
+|---|---|
+| Base image | `runpod/worker-comfyui:5.8.5-base-cuda12.8.1` (RunPod's official ComfyUI Serverless worker) |
+| LTX nodes | `Lightricks/ComfyUI-LTXVideo` (auto-installed at build) |
+| Models | `Lightricks/LTX-2.3-fp8` distilled + `Lightricks/gemma-3-12b-it-qat-q4_0-unquantized` text encoder + spatial upscaler — all baked in |
+| Workflow | Driven entirely by JSON sent in the `/run` body |
+
+## API contract
+
+**Input** (POST `/run`):
+
+```json
+{
+  "input": {
+    "workflow": { ...ComfyUI graph JSON... },
+    "images": [{ "name": "first_frame.png", "image": "<base64>" }]
+  }
+}
+```
+
+The handler is the stock RunPod ComfyUI handler — see
+[`runpod-workers/worker-comfyui`](https://github.com/runpod-workers/worker-comfyui).
+
+**Output** (`/status/{id}` once `COMPLETED`): base64 video bytes from
+the workflow's `CreateVideo` (or equivalent) output node.
+
+## Workflow templates
+
+`workflows/ltx-2.3-t2v-i2v-distilled.json` — the official Lightricks
+LTX-2.3 single-stage distilled workflow (44 nodes). AdsXFlow's
+`app/services/ltx_video_provider.py` parameterises this template at
+runtime (prompt, seed, duration, image_url, etc.) and submits it.
+
+## Deploying
+
+1. Push commits to `main`.
+2. RunPod Console → Serverless → New Endpoint → Deploy from GitHub →
+   pick `salesdeploy-hue/Runpod-ltx-2.3` (this repo) → branch `main`.
+3. Hub will read `.runpod/hub.json` for defaults (60 GB container
+   disk, 32 GB GPU floor, 1 max worker, 30s idle, scale-to-zero).
+4. Optional build env: `HF_TOKEN` if you swap the Gemma repo to
+   Google's gated `gemma-3-4b-pt`. Otherwise unused.
+
+## Backup branch
+
+The previous native-pipeline handler is preserved on
+`backup/ltx-2.3-native-pipeline` if anyone wants to revisit that
+path with fp8 quantization or a 80 GB+ GPU floor.
 
 ## Cost shape
 
-| GPU         | Flex $/s     | Time / 8s clip | Cost / 24s reel | vs Veo 3.1 Fast |
-|-------------|--------------|----------------|-----------------|-----------------|
-| L40S 48GB   | $0.00053     | ~30-40s        | **~$0.055**     | **~65× cheaper** |
-| A100 80GB   | $0.00076     | ~20-25s        | ~$0.045         | ~80× cheaper    |
-| H100 80GB   | $0.00116     | ~12-15s        | ~$0.045         | ~80× cheaper    |
-| (Veo Fast)  | n/a          | n/a            | $3.60           | —               |
+| GPU | Flex $/s | First render (cold + DL) | Warm render (8s clip) |
+|---|---|---|---|
+| RTX 5090 32GB | $0.00040 | ~3 min | ~$0.020 |
+| L40S 48GB | $0.00053 | ~3 min | ~$0.022 |
+| A100 80GB | $0.00076 | ~3 min | ~$0.018 |
 
-(Numbers assume LTX-2.3 distilled-1.1 at 8 inference steps. The
-**dev** checkpoint at 40 steps is ~5× slower and proportionally
-more expensive.)
-
-## Deploy in 5 minutes
-
-1. Push this directory to a Git repo (private works too if you
-   connect RunPod's GitHub app).
-2. RunPod console → **Serverless** → **New Endpoint** → **Deploy
-   from GitHub** → point at the repo + this directory.
-3. Worker config:
-   - **GPU**: **L40S 48GB minimum** (LTX-2.3 is 22B in bf16 ≈ 44GB).
-     A100 80GB recommended for headroom + faster renders.
-   - **Min workers**: `0` (true scale-to-zero).
-   - **Max workers**: `5` (covers ~190 reels/hr peak; tune to traffic).
-   - **Idle timeout**: `30s`.
-   - **Execution timeout**: `300s`.
-   - **FlashBoot**: `ON`.
-4. Build env vars (set in the endpoint's "Container env" panel):
-   - `HF_TOKEN` — your HuggingFace access token. Required for the
-     gated Gemma model. Without this the build will fail at the
-     `snapshot_download` step.
-5. Wait for the first build (~25-40 min — pulls ~50GB of weights into
-   the image cache).
-6. Copy the **Endpoint ID** from the dashboard.
-
-## Wire it to AdsXFlow
-
-```bash
-# backend/.env
-RUNPOD_API_KEY=your-account-key                      # console → Settings → API Keys
-RUNPOD_LTX_ENDPOINT_ID=your-endpoint-id-from-step-6
-```
-
-Restart the backend. The bento model picker in Studio surfaces
-**LTX 2.3** as a render target. The "OPEN-SOURCE" tile goes from
-dimmed (Configure) → live the moment both env vars are set.
-
-## What's different from LTX 1.x
-
-LTX 1.x (LTX-Video 13B) was the previous generation. LTX-2.3 brings:
-
-- **Native synchronized audio + lip-sync**. A talking-head reel
-  comes back as a single MP4 with the dialog already voiced — no
-  separate Chirp-TTS / mux step. (The provider's `supports_audio`
-  + `supports_lip_sync` registry flags both flip to `true`.)
-- **Up to 1080p portrait** (LTX 1.x topped out at 768×1280).
-- **Better prompt adherence** — the gated attention text connector
-  follows multi-clause prompts much more reliably.
-- **Bigger model** — 22B vs 13B → needs L40S 48GB minimum.
-
-## Test locally before deploying
-
-```bash
-pip install -r requirements.txt
-# Also clone + install the LTX-2 repo packages:
-git clone https://github.com/Lightricks/LTX-2.git /tmp/LTX-2
-pip install -e /tmp/LTX-2/packages/ltx-core
-pip install -e /tmp/LTX-2/packages/ltx-pipelines
-# Set checkpoint paths to wherever you've staged the weights:
-export LTX_CHECKPOINT_PATH=/path/to/ltx-2.3-22b-distilled-1.1.safetensors
-export LTX_SPATIAL_UPSAMPLER_PATH=/path/to/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
-export LTX_GEMMA_ROOT=/path/to/gemma
-python handler.py     # uses test_input.json
-```
-
-## I/O contract
-
-This worker implements the schema documented at
-`backend/app/services/ltx_video_provider.py`. If you replace this
-with a different LTX-2.3 worker (community templates from Civitai
-etc.), make sure its `event["input"]` accepts the same keys and its
-return value matches the documented output shape.
-
-## Storage / billing notes
-
-- **No persistent network volume.** Weights are baked into the
-  Docker image at build time, so the runtime cost is purely Flex
-  inference seconds. No idle storage bill.
-- **Cancel-on-timeout** is enforced server-side by AdsXFlow's
-  `runpod_client.wait_for_completion` — if our wall-clock budget
-  elapses, we POST `/cancel/{job_id}` so the worker stops billing
-  immediately rather than running to completion.
-- **Cold starts** are FlashBoot-bounded to ~2-5s when the worker
-  pool has been warm in the last hour. From fully cold, expect
-  ~60-90s for the first render (model load + first inference). The
-  pool stays warm for 30s after each job by default.
+Image is ~55 GB (LTX fp8 + Gemma + ComfyUI) — first build is
+~25-40 min (one-time per commit).
