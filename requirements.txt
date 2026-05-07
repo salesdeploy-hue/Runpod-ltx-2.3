@@ -1,23 +1,10 @@
-# RunPod worker SDK — provides runpod.serverless.start
-runpod>=1.7.0
+# RunPod worker SDK
+runpod>=1.7.13
 
-# Torch stack — let runpod/base's pre-installed torch stay; we just
-# layer transformers + diffusers on top. Don't pin torch here, it's
-# already in the base image and re-pinning would yank it down + lose
-# the matching CUDA wheel.
-transformers>=4.50.0,<5
-accelerate>=1.0.0
+# Used directly by handler.py — kept minimal. ltx-core / ltx-pipelines
+# bring their own deps in via setup install (transformers, accelerate,
+# safetensors, einops, scipy, av, openimageio, tqdm, pillow). No need
+# to repeat them here.
 huggingface_hub>=0.26.0
 hf_transfer>=0.1.8
-sentencepiece>=0.2.0
-safetensors>=0.4.5
-einops>=0.8.0
-
-# Image + numerical
 Pillow>=10.4.0
-numpy<2.0
-
-# Video encode (LTX-2 pipeline writes mp4 directly; this is for any
-# fallback handler operations that needed manual encode).
-imageio>=2.36.0
-imageio-ffmpeg>=0.5.1
