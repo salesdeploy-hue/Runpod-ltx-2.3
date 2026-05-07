@@ -1,0 +1,31 @@
+{
+  "title": "AdsXFlow LTX-2.3 Worker",
+  "description": "RunPod Serverless worker for Lightricks LTX-2.3 (22B audio-video). Lazy-loads weights to /runpod-volume/models on first job, then re-uses cached weights across cold starts.",
+  "type": "serverless",
+  "category": "video",
+  "config": {
+    "runpod": "GPU",
+    "containerDiskInGb": 20,
+    "gpuTypeIds": [
+      "NVIDIA L40S",
+      "NVIDIA A100 80GB PCIe",
+      "NVIDIA H100 80GB HBM3"
+    ],
+    "gpuCount": 1,
+    "workersMin": 0,
+    "workersMax": 1,
+    "idleTimeout": 30,
+    "executionTimeoutMs": 600000,
+    "flashboot": true,
+    "scalerType": "QUEUE_DELAY",
+    "scalerValue": 4,
+    "env": [
+      { "key": "HF_HUB_ENABLE_HF_TRANSFER", "value": "1" },
+      { "key": "LTX_REPO", "value": "Lightricks/LTX-2.3" },
+      { "key": "GEMMA_REPO", "value": "google/gemma-3-1b-pt" }
+    ]
+  },
+  "presets": [
+    { "name": "default", "scale": "L40S" }
+  ]
+}
