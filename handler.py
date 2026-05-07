@@ -245,42 +245,71 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
         with tempfile.TemporaryDirectory() as work_dir_str:
             work_dir = Path(work_dir_str)
 
+            # ImageConditioningInput is in ltx_pipelines.utils.args (NOT
+            # ltx_core.components.guiders — that was an earlier wrong path).
+            from ltx_pipelines.utils.args import (  # type: ignore
+                ImageConditioningInput,
+            )
+            from ltx_pipelines.utils.constants import (  # type: ignore
+                DEFAULT_NEGATIVE_PROMPT,
+                detect_params,
+            )
+            from ltx_pipelines.utils.media_io import encode_video  # type: ignore
+            from ltx_core.model.video_vae import (  # type: ignore
+                TilingConfig, get_video_chunks_number,
+            )
+
             images = []
             if first_frame_b64:
-                from ltx_core.components.guiders import (  # type: ignore
-                    ImageConditioningInput,
-                )
                 ff_path = work_dir / "first_frame.jpg"
                 _decode_image_b64_to_path(first_frame_b64, ff_path)
+                # ImageConditioningInput(path, frame_index, strength, crf)
                 images = [ImageConditioningInput(str(ff_path), 0, 1.0, 33)]
 
             t_load_start = time.time()
             pipeline = _load_pipeline()
             t_load_ms = int((time.time() - t_load_start) * 1000)
 
-            if seed:
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
+            # Pull canonical params for this checkpoint. detect_params
+            # reads safetensors metadata and picks LTX_2_3_PARAMS (or
+            # LTX_2_PARAMS) — already includes the right video/audio
+            # guider params and step counts. _ensure_weights() is
+            # idempotent + cached, so re-calling it costs nothing.
+            paths_dict = _ensure_weights()
+            params = detect_params(str(paths_dict["checkpoint"]))
+            # Effective inference steps: caller's override or distilled-1.1
+            # default of 8 (which is what the operator wants for speed).
+            effective_steps = steps if steps else params.num_inference_steps
 
             output_path = work_dir / "ltx23_output.mp4"
-            call_kwargs: dict[str, Any] = dict(
+            tiling_config = TilingConfig.default()
+            video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+
+            t_infer_start = time.time()
+            video, audio = pipeline(
                 prompt=prompt,
-                output_path=str(output_path),
-                images=images,
+                negative_prompt=negative or DEFAULT_NEGATIVE_PROMPT,
+                seed=seed or params.seed,
                 height=height,
                 width=width,
                 num_frames=num_frames,
                 frame_rate=fps,
-                num_inference_steps=steps,
+                num_inference_steps=effective_steps,
+                video_guider_params=params.video_guider_params,
+                audio_guider_params=params.audio_guider_params,
+                images=images,
+                tiling_config=tiling_config,
+                max_batch_size=1,
             )
-            if negative and guidance > 1.01:
-                call_kwargs["negative_prompt"] = negative
-            if guidance > 1.01:
-                call_kwargs["cfg_scale"] = guidance
-
-            t_infer_start = time.time()
-            pipeline(**call_kwargs)
+            # Pipeline returns iterators; encode_video drains them and
+            # writes the MP4 to disk (with synchronized audio).
+            encode_video(
+                video=video,
+                fps=fps,
+                audio=audio,
+                output_path=str(output_path),
+                video_chunks_number=video_chunks_number,
+            )
             t_infer_ms = int((time.time() - t_infer_start) * 1000)
 
             if not output_path.exists() or output_path.stat().st_size < 1024:
