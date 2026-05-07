@@ -105,24 +105,23 @@ def _ensure_weights() -> dict[str, Path]:
             local_dir=str(MODELS_ROOT),
         )
 
-    # 3. Gemma 3 1B text encoder — gated, needs HF_TOKEN. Skip the
-    # snapshot_download if the dir already has a config.json (cheap
-    # check — full checksum would require listing every file).
-    gemma_config = gemma_dir / "config.json"
-    if not gemma_config.exists():
-        if not hf_token:
-            raise RuntimeError(
-                "HF_TOKEN env var not set. Gemma 3 1B is gated on "
-                "HuggingFace; the worker can't download it without a "
-                "read token. Add HF_TOKEN to the endpoint's runtime "
-                "env vars (RunPod console → endpoint → Edit → Env)."
-            )
+    # 3. Gemma multimodal text encoder. LTX-2.3 needs the multimodal
+    #    Gemma 3 (loads `preprocessor_config.json` via Gemma3Processor
+    #    for image-conditioning). Default GEMMA_REPO is now
+    #    `Lightricks/gemma-3-12b-it-qat-q4_0-unquantized` (~22.7GB) —
+    #    open + multimodal — so HF_TOKEN is optional. We pass it if
+    #    present (lets operators substitute the gated google/gemma-3-4b-pt),
+    #    but no longer fail when absent.
+    #    Marker is preprocessor_config.json (the multimodal hint),
+    #    not config.json (text-only Gemmas have that too).
+    gemma_marker = gemma_dir / "preprocessor_config.json"
+    if not gemma_marker.exists():
         print(f"[handler] downloading {gemma_repo} → {gemma_dir}", flush=True)
         gemma_dir.mkdir(parents=True, exist_ok=True)
         snapshot_download(
             repo_id=gemma_repo,
             local_dir=str(gemma_dir),
-            token=hf_token,
+            token=hf_token,  # None is fine for ungated repos
         )
 
     return {
