@@ -1,10 +1,24 @@
-# RunPod worker SDK
-runpod>=1.7.13
+# Pinned to MATCH Lightricks/LTX-2's uv.lock exactly. Drift past these
+# versions has bitten us repeatedly (the SiglipVisionModel API change
+# in transformers >=4.55, accelerate breakage, etc.). Don't bump
+# without re-running our test render against the new combo.
 
-# Used directly by handler.py — kept minimal. ltx-core / ltx-pipelines
-# bring their own deps in via setup install (transformers, accelerate,
-# safetensors, einops, scipy, av, openimageio, tqdm, pillow). No need
-# to repeat them here.
-huggingface_hub>=0.26.0
-hf_transfer>=0.1.8
-Pillow>=10.4.0
+runpod==1.7.13
+
+# Locked to LTX-2 uv.lock (non-fp8/non-xformers extra branch):
+transformers==4.53.1
+torchaudio==2.7.1
+accelerate==1.12.0
+safetensors==0.7.0
+huggingface_hub==0.36.0
+sentencepiece==0.2.1
+einops==0.8.1
+scipy==1.15.3
+av==16.1.0
+openimageio==3.0.16.0
+Pillow==10.3.0
+tqdm==4.67.1
+numpy==1.26.4
+
+# Fast HF Hub downloads (LTX-2 doesn't depend on this; we use it).
+hf_transfer==0.1.8

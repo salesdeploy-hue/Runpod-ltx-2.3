@@ -1,17 +1,9 @@
 # AdsXFlow LTX-2.3 RunPod Serverless worker.
 #
-# Base: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
-#
-# Why this exact tag (root cause of all the silent worker crashes):
-# Lightricks LTX-2's `ltx-core` pyproject.toml pins
-#   - torch ~= 2.7  (CUDA 12.9 wheel index)
-# Earlier attempts used torch 2.4 / CUDA 12.4 base + `pip install
-# --no-deps` to suppress the conflict — that "succeeded" at build
-# time but the workers crashed immediately at runtime when
-# ltx-pipelines imported torch 2.7-only attributes. CUDA 12.8 ⇄ 12.9
-# wheels are forward-compatible, so torch 2.7.1 + CUDA 12.8 is the
-# right pairing here (12.9 base images aren't published on Docker Hub
-# yet by the official PyTorch project).
+# Versions pinned to MATCH Lightricks/LTX-2's uv.lock exactly. Each
+# loose pin we tried previously drifted past their tested set and
+# broke at runtime (SiglipVisionModel API drift in transformers >=4.55,
+# accelerate API changes, etc.).
 
 FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
@@ -32,37 +24,44 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
+# runpod/base ships only `python3`; LTX-2 packages invoke `python`
+# in some build paths.
+RUN ln -sf "$(which python3)" /usr/local/bin/python
+
 WORKDIR /workspace
 
-# Worker-side requirements (runpod SDK + transformers / huggingface
-# hub etc.). Base image already has torch 2.7.1; do NOT touch it.
-COPY requirements.txt /workspace/requirements.txt
-RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r /workspace/requirements.txt
+RUN pip install --upgrade pip setuptools wheel
 
-# Install LTX-2 packages WITH their deps. Since torch 2.7.1 is
-# already present and matches `torch~=2.7`, pip will reuse the
-# pre-installed wheel and only fetch the remaining deps (av, einops,
-# scipy, etc.). No --no-deps trick — that was the silent-crash bug.
+# CRITICAL ORDER:
+# 1. Install our pinned requirements FIRST. These match Lightricks'
+#    uv.lock exactly so the LTX-2 install step (next) sees its deps
+#    already satisfied and doesn't re-resolve to newer breaking
+#    versions.
+COPY requirements.txt /workspace/requirements.txt
+RUN pip install --no-cache-dir -r /workspace/requirements.txt
+
+# 2. Now install LTX-2 packages. Use --no-deps because every dep is
+#    already pinned in step 1; --no-deps prevents pip's resolver from
+#    yanking transformers/accelerate/etc to newer versions.
 ARG LTX2_REF=main
 RUN git clone --depth 1 --branch ${LTX2_REF} https://github.com/Lightricks/LTX-2.git /workspace/LTX-2 \
     && cd /workspace/LTX-2 \
-    && pip install --no-cache-dir -e packages/ltx-core \
-    && pip install --no-cache-dir -e packages/ltx-pipelines
+    && pip install --no-cache-dir --no-deps -e packages/ltx-core \
+    && pip install --no-cache-dir --no-deps -e packages/ltx-pipelines
 
 COPY handler.py /workspace/handler.py
 
-ENV LTX_MODELS_ROOT=/runpod-volume/models \
+ENV LTX_MODELS_ROOT=/workspace/models \
     LTX_FALLBACK_MODELS_ROOT=/workspace/models \
     LTX_REPO=Lightricks/LTX-2.3 \
-    GEMMA_REPO=google/gemma-3-1b-pt \
-    HF_HUB_ENABLE_HF_TRANSFER=1
+    GEMMA_REPO=Lightricks/gemma-3-12b-it-qat-q4_0-unquantized \
+    HF_HUB_ENABLE_HF_TRANSFER=0
 
 EXPOSE 5000
 
-# Light healthcheck — verify cuda is reachable. If the GPU isn't
-# bound we want to fail fast and surface that in console logs.
+# Healthcheck verifies CUDA + transformers are importable. If either
+# breaks the rolling update never completes — fail fast, not silent.
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=180s \
-    CMD python -c "import torch; assert torch.cuda.is_available()" || exit 1
+    CMD python -c "import torch, transformers; assert torch.cuda.is_available()" || exit 1
 
 CMD ["python", "-u", "/workspace/handler.py"]
