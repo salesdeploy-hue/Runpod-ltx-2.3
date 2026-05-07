@@ -1,41 +1,16 @@
-"""Reference RunPod Serverless handler for LTX-2.3.
+"""LTX-2.3 RunPod Serverless handler — slim image + lazy weights.
 
-LTX-2.3 (released Jan 2026) is the 22B audio-video foundation model
-from Lightricks. Vs the 13B LTX-Video 1.x:
+Why this shape (vs the previous bake-50GB-into-image approach):
+  - Image stays small (~5GB) so cold starts pull fast (~30s) instead
+    of stalling for 30+ min on a parallel-pull bandwidth fight.
+  - Weights download once into /runpod-volume/models/ (RunPod's
+    standard mount path for network volumes). Subsequent cold starts
+    just remount the volume → re-use the cached weights.
+  - No HF_TOKEN required at build time. The runtime env on the
+    template provides it; we only hit HF Hub on first run.
 
-  * 22B params instead of 13B → needs ≥48GB VRAM (L40S minimum;
-    A100 80GB / H100 80GB recommended for headroom).
-  * **Native synchronized audio** — generates a single MP4 with
-    audio baked in. No separate VO step needed for talking-head /
-    documentary archetypes.
-  * Native portrait (9:16) at up to 1080p.
-  * Better prompt adherence (gated attention text connector).
-  * Uses Lightricks' native `ltx_pipelines.TI2VidTwoStagesPipeline`
-    instead of diffusers — diffusers support is "coming soon" but
-    the model_index.json is missing as of 2026-05.
-
-I/O contract is unchanged from the LTX 1.x handler — the AdsXFlow
-client (`app/services/ltx_video_provider.py`) speaks the same
-schema and our `_decode_video_output` accepts the same shapes.
-This means the registry tile in Studio just gets a label / cost /
-capability flag refresh; no client-side change is required.
-
-Deploy on RunPod:
-  1. Push this directory + Dockerfile to a Git repo.
-  2. RunPod → Serverless → New Endpoint → Deploy from GitHub.
-  3. GPU: **L40S 48GB minimum**, A100 80GB recommended.
-     Min workers: 0 (scale-to-zero).
-     Max workers: 5.
-     Idle timeout: 30s.
-     Execution timeout: 300s.
-     FlashBoot: ON.
-  4. After deploy, copy the endpoint id into AdsXFlow .env as
-     `RUNPOD_LTX_ENDPOINT_ID`.
-
-Cost shape (L40S Flex, distilled-1.1 at 8 inference steps):
-  - 8s clip render: ~30-40s GPU → ~$0.018 per beat.
-  - Full 24s reel: 3 × ~$0.018 = ~$0.055 per reel WITH AUDIO.
-  - vs Veo 3.1 Fast ($3.60 per 24s reel): ~65× cheaper.
+I/O contract is unchanged from the prior handler — the AdsXFlow
+client (`app/services/ltx_video_provider.py`) speaks the same schema.
 """
 from __future__ import annotations
 
@@ -43,6 +18,8 @@ import base64
 import io
 import os
 import tempfile
+import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -51,110 +28,162 @@ import runpod  # type: ignore
 import torch  # type: ignore
 
 
-# Singletons survive across warm invocations of the same worker
-# container — model load (~5-15s on a warm filesystem cache) only
-# happens once per cold start, not once per render.
+# ─── Singletons (warm-call reuse) ──────────────────────────────────────────
 _PIPELINE = None
 _PIPELINE_LOAD_ERROR: str | None = None
+_LOAD_LOCK = threading.Lock()
 
 
-# ─── Model paths — set via env vars, defaults match Dockerfile cache ──
-#
-# The Dockerfile pre-downloads these into /workspace/models so the
-# first job after a cold boot doesn't pay the 50GB+ HF Hub fetch.
-# Operators can override any of these by setting the env var on the
-# RunPod endpoint config (e.g. to point at a network-volume cache).
-_CHECKPOINT_PATH = os.environ.get(
-    "LTX_CHECKPOINT_PATH",
-    "/workspace/models/ltx-2.3-22b-distilled-1.1.safetensors",
-)
-_SPATIAL_UPSAMPLER_PATH = os.environ.get(
-    "LTX_SPATIAL_UPSAMPLER_PATH",
-    "/workspace/models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-)
-_GEMMA_ROOT = os.environ.get(
-    "LTX_GEMMA_ROOT",
-    "/workspace/models/gemma",
-)
-# Distilled-1.1 ships as a LoRA over the dev base; specify path(s)
-# here when using the full pipeline. Empty when running the
-# all-in-one distilled checkpoint above.
-_DISTILLED_LORA_PATH = os.environ.get("LTX_DISTILLED_LORA_PATH", "")
+# ─── Resolve where weights live ────────────────────────────────────────────
+# Prefer the network volume if attached; fall back to the worker's
+# container disk. We compute MODELS_ROOT once at module load.
+
+def _pick_models_root() -> Path:
+    primary = Path(os.environ.get("LTX_MODELS_ROOT", "/runpod-volume/models"))
+    fallback = Path(os.environ.get("LTX_FALLBACK_MODELS_ROOT", "/workspace/models"))
+    # If /runpod-volume exists, use it (volume is mounted) even if
+    # /runpod-volume/models doesn't yet — we'll create it.
+    parent = primary.parent
+    if parent.exists() and parent.is_dir():
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+MODELS_ROOT = _pick_models_root()
+
+
+def _file_complete(p: Path, *, min_size_bytes: int) -> bool:
+    """Sanity-check a downloaded file. Avoid loading half-pulled
+    safetensors — they'd raise opaque parse errors deep inside the
+    pipeline and the operator would chase the wrong lead."""
+    try:
+        return p.exists() and p.stat().st_size >= min_size_bytes
+    except OSError:
+        return False
+
+
+def _ensure_weights() -> dict[str, Path]:
+    """Download (or reuse cached) LTX + Gemma weights.
+
+    Order:
+      1. LTX-2.3 distilled-1.1 base checkpoint (~44GB)
+      2. Spatial upscaler ×2 v1.1 (~1GB)
+      3. Gemma 3 1B text encoder (~2GB) — gated, needs HF_TOKEN
+
+    Returns a dict of resolved paths. Idempotent — `hf_hub_download`
+    is a no-op when the file already exists at the target with
+    matching size + sha256.
+    """
+    from huggingface_hub import hf_hub_download, snapshot_download  # type: ignore
+
+    ltx_repo = os.environ.get("LTX_REPO", "Lightricks/LTX-2.3")
+    gemma_repo = os.environ.get("GEMMA_REPO", "google/gemma-3-1b-pt")
+    hf_token = os.environ.get("HF_TOKEN") or None
+
+    ckpt_name = "ltx-2.3-22b-distilled-1.1.safetensors"
+    upscaler_name = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    gemma_dir = MODELS_ROOT / "gemma"
+
+    ckpt_path = MODELS_ROOT / ckpt_name
+    upscaler_path = MODELS_ROOT / upscaler_name
+
+    # 1. LTX 22B distilled-1.1
+    if not _file_complete(ckpt_path, min_size_bytes=20 * 1024 ** 3):  # >20GB
+        print(f"[handler] downloading {ckpt_name} → {MODELS_ROOT}", flush=True)
+        hf_hub_download(
+            repo_id=ltx_repo, filename=ckpt_name,
+            local_dir=str(MODELS_ROOT),
+        )
+
+    # 2. Spatial upscaler
+    if not _file_complete(upscaler_path, min_size_bytes=500 * 1024 * 1024):  # >500MB
+        print(f"[handler] downloading {upscaler_name}", flush=True)
+        hf_hub_download(
+            repo_id=ltx_repo, filename=upscaler_name,
+            local_dir=str(MODELS_ROOT),
+        )
+
+    # 3. Gemma 3 1B text encoder — gated, needs HF_TOKEN. Skip the
+    # snapshot_download if the dir already has a config.json (cheap
+    # check — full checksum would require listing every file).
+    gemma_config = gemma_dir / "config.json"
+    if not gemma_config.exists():
+        if not hf_token:
+            raise RuntimeError(
+                "HF_TOKEN env var not set. Gemma 3 1B is gated on "
+                "HuggingFace; the worker can't download it without a "
+                "read token. Add HF_TOKEN to the endpoint's runtime "
+                "env vars (RunPod console → endpoint → Edit → Env)."
+            )
+        print(f"[handler] downloading {gemma_repo} → {gemma_dir}", flush=True)
+        gemma_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=gemma_repo,
+            local_dir=str(gemma_dir),
+            token=hf_token,
+        )
+
+    return {
+        "checkpoint": ckpt_path,
+        "spatial_upsampler": upscaler_path,
+        "gemma_root": gemma_dir,
+    }
 
 
 def _load_pipeline():
-    """Instantiate the LTX-2.3 production pipeline ONCE per container.
+    """Build the LTX-2.3 production pipeline once per warm container.
 
-    Raises a RuntimeError that gets captured into the response if any
-    checkpoint is missing — the operator sees a clear "missing path"
-    error instead of a cryptic torch traceback in the worker logs.
+    Cached failure: if a load attempt fails, we cache the error and
+    re-raise on every subsequent call so we don't keep retrying the
+    same expensive load (model load is ~30s on a warm machine).
     """
     global _PIPELINE, _PIPELINE_LOAD_ERROR
     if _PIPELINE is not None:
         return _PIPELINE
-    if _PIPELINE_LOAD_ERROR is not None:
-        # Re-raise the cached error so we don't keep retrying a
-        # broken load on every job (~30s per attempt on a 22B model).
-        raise RuntimeError(_PIPELINE_LOAD_ERROR)
-
-    try:
-        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline  # type: ignore
-    except ImportError as e:
-        msg = (
-            f"ltx_pipelines is not installed in the container. "
-            f"Build the Docker image with the LTX-2 repo cloned + "
-            f"`uv sync --frozen` against packages/ltx-pipelines. "
-            f"Underlying ImportError: {e}"
-        )
-        _PIPELINE_LOAD_ERROR = msg
-        raise RuntimeError(msg)
-
-    for label, path in (
-        ("LTX_CHECKPOINT_PATH", _CHECKPOINT_PATH),
-        ("LTX_SPATIAL_UPSAMPLER_PATH", _SPATIAL_UPSAMPLER_PATH),
-    ):
-        if not Path(path).exists():
+    with _LOAD_LOCK:
+        if _PIPELINE is not None:
+            return _PIPELINE
+        if _PIPELINE_LOAD_ERROR:
+            raise RuntimeError(_PIPELINE_LOAD_ERROR)
+        try:
+            from ltx_pipelines.ti2vid_two_stages import (  # type: ignore
+                TI2VidTwoStagesPipeline,
+            )
+        except ImportError as e:
             msg = (
-                f"{label}={path} not found inside the container. "
-                f"Either bake the checkpoint into the image at build "
-                f"time (recommended) or mount a network volume "
-                f"containing it. See the Dockerfile."
+                "ltx_pipelines is not installed. The Dockerfile must "
+                f"`pip install -e packages/ltx-pipelines`. ImportError: {e}"
             )
             _PIPELINE_LOAD_ERROR = msg
             raise RuntimeError(msg)
-    if not Path(_GEMMA_ROOT).exists():
-        msg = (
-            f"LTX_GEMMA_ROOT={_GEMMA_ROOT} not found. LTX-2.3 uses "
-            f"Gemma as the text encoder; download it at image-build "
-            f"time."
-        )
-        _PIPELINE_LOAD_ERROR = msg
-        raise RuntimeError(msg)
 
-    distilled_lora_arg: list = []
-    if _DISTILLED_LORA_PATH:
-        # ltx_pipelines accepts a list of LoRA paths to stack on top
-        # of the base checkpoint. Distilled-1.1 already bakes the
-        # LoRA into a merged safetensors above; this is for operators
-        # who chose the dev + LoRA layout instead.
-        distilled_lora_arg = [p for p in _DISTILLED_LORA_PATH.split(",") if p]
+        try:
+            paths = _ensure_weights()
+        except Exception as e:
+            msg = f"Weight download failed: {type(e).__name__}: {e}"
+            _PIPELINE_LOAD_ERROR = msg
+            raise RuntimeError(msg)
 
-    _PIPELINE = TI2VidTwoStagesPipeline(
-        checkpoint_path=_CHECKPOINT_PATH,
-        distilled_lora=distilled_lora_arg,
-        spatial_upsampler_path=_SPATIAL_UPSAMPLER_PATH,
-        gemma_root=_GEMMA_ROOT,
-    )
-    return _PIPELINE
+        try:
+            _PIPELINE = TI2VidTwoStagesPipeline(
+                checkpoint_path=str(paths["checkpoint"]),
+                distilled_lora=[],  # distilled-1.1 is the merged form
+                spatial_upsampler_path=str(paths["spatial_upsampler"]),
+                gemma_root=str(paths["gemma_root"]),
+            )
+        except Exception as e:
+            msg = f"Pipeline construction failed: {type(e).__name__}: {e}"
+            _PIPELINE_LOAD_ERROR = msg
+            raise RuntimeError(msg)
+        return _PIPELINE
 
 
-# ─── Helpers ───────────────────────────────────────────────────────────────
+# ─── Frame / image helpers ─────────────────────────────────────────────────
 
 
 def _decode_image_b64_to_path(b64: str, dest: Path) -> None:
-    """Decode the inbound base64 first frame to a JPG file on disk —
-    the LTX pipeline's ImageConditioningInput takes a path, not bytes.
-    """
     if b64.startswith("data:"):
         b64 = b64.split(",", 1)[-1]
     raw = base64.b64decode(b64, validate=False)
@@ -164,8 +193,6 @@ def _decode_image_b64_to_path(b64: str, dest: Path) -> None:
 
 
 def _parse_resolution(res: str) -> tuple[int, int]:
-    """LTX-2.3 requires width + height divisible by 32. Snap to the
-    nearest valid pair and clamp to 256-1920."""
     try:
         w, h = res.lower().split("x")
         w_i, h_i = int(w), int(h)
@@ -177,16 +204,10 @@ def _parse_resolution(res: str) -> tuple[int, int]:
 
 
 def _frames_for_duration(duration_s: int, fps: float) -> int:
-    """LTX-2.3 frame-count rule: (num_frames - 1) divisible by 8.
-
-    25fps × 4s = 100 → snap to 97 (96+1) or 105 (104+1). Pick nearest
-    that respects the rule and is in the practical 33-241 range
-    (~1.3s to ~9.6s of footage).
-    """
+    """LTX 2.3: (num_frames - 1) divisible by 8."""
     raw = max(9, int(round(duration_s * fps)))
     candidates = [n for n in range(max(33, raw - 12), min(241, raw + 12) + 1) if (n - 1) % 8 == 0]
     if not candidates:
-        # Fallback — round to nearest valid count globally.
         return ((raw - 1) // 8) * 8 + 1
     return min(candidates, key=lambda n: abs(n - raw))
 
@@ -195,9 +216,7 @@ def _frames_for_duration(duration_s: int, fps: float) -> int:
 
 
 def handler(event: dict[str, Any]) -> dict[str, Any]:
-    """RunPod entry point. Receives `event['input']` per RunPod
-    convention; returns the I/O-contract shape documented at the top
-    of `app/services/ltx_video_provider.py`."""
+    t0 = time.time()
     try:
         inp = event.get("input") or {}
         prompt = (inp.get("prompt") or "").strip()
@@ -206,9 +225,9 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
 
         negative = (inp.get("negative_prompt") or "").strip() or None
         duration_s = int(inp.get("duration_seconds") or 8)
-        fps = float(inp.get("fps") or 25.0)              # LTX 2.3 default
-        steps = int(inp.get("num_inference_steps") or 8) # distilled = 8
-        guidance = float(inp.get("guidance_scale") or 1.0)  # CFG=1 for distilled
+        fps = float(inp.get("fps") or 25.0)
+        steps = int(inp.get("num_inference_steps") or 8)
+        guidance = float(inp.get("guidance_scale") or 1.0)
         seed = int(inp.get("seed") or 0)
         resolution = inp.get("resolution") or "768x1280"
         first_frame_b64 = inp.get("first_frame_b64") or ""
@@ -219,8 +238,6 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
         with tempfile.TemporaryDirectory() as work_dir_str:
             work_dir = Path(work_dir_str)
 
-            # Image conditioning input — empty list for text-to-video,
-            # one entry for image-to-video (first frame).
             images = []
             if first_frame_b64:
                 from ltx_core.components.guiders import (  # type: ignore
@@ -228,26 +245,18 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
                 )
                 ff_path = work_dir / "first_frame.jpg"
                 _decode_image_b64_to_path(first_frame_b64, ff_path)
-                # ImageConditioningInput(path, frame_index, strength, crf)
-                # frame_index=0 anchors at the start; strength=1.0 = hard
-                # lock (the inbound frame appears verbatim); crf=33 is
-                # the video-codec hint for the conditioning pass.
                 images = [ImageConditioningInput(str(ff_path), 0, 1.0, 33)]
 
-            output_path = work_dir / "ltx23_output.mp4"
-
+            t_load_start = time.time()
             pipeline = _load_pipeline()
+            t_load_ms = int((time.time() - t_load_start) * 1000)
 
             if seed:
-                # The LTX pipeline reads from torch's global RNG; seed
-                # both CUDA and CPU streams for reproducibility.
                 torch.manual_seed(seed)
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed)
 
-            # Build the pipeline kwargs. We pass `negative_prompt` and
-            # `cfg_scale` only when meaningful — the distilled model
-            # skips CFG (cfg_scale=1.0) and ignores negative prompts.
+            output_path = work_dir / "ltx23_output.mp4"
             call_kwargs: dict[str, Any] = dict(
                 prompt=prompt,
                 output_path=str(output_path),
@@ -261,21 +270,19 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
             if negative and guidance > 1.01:
                 call_kwargs["negative_prompt"] = negative
             if guidance > 1.01:
-                # MultiModalGuiderParams is the LTX-2 way of passing
-                # CFG; we set it via the dict-friendly kwarg path so
-                # the worker doesn't have to import the dataclass.
                 call_kwargs["cfg_scale"] = guidance
 
+            t_infer_start = time.time()
             pipeline(**call_kwargs)
+            t_infer_ms = int((time.time() - t_infer_start) * 1000)
 
             if not output_path.exists() or output_path.stat().st_size < 1024:
                 return {
                     "error": (
                         f"Pipeline produced no output (or empty file) at "
-                        f"{output_path}. Check worker logs."
+                        f"{output_path}."
                     ),
                 }
-
             video_bytes = output_path.read_bytes()
 
         return {
@@ -290,18 +297,21 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
             "fps": fps,
             "model": "ltx-2.3-22b-distilled-1.1",
             "audio_baked_in": True,
+            "timing_ms": {
+                "model_load_or_lazy_dl": t_load_ms,
+                "inference": t_infer_ms,
+                "total": int((time.time() - t0) * 1000),
+            },
+            "models_root": str(MODELS_ROOT),
         }
     except Exception as e:
         return {
             "error": f"{type(e).__name__}: {e}",
             "trace": traceback.format_exc()[-3000:],
+            "models_root": str(MODELS_ROOT),
         }
 
 
-# Module-level entrypoint — RunPod's GitHub deploy scanner greps the
-# default branch for `runpod.serverless.start(` at top-level scope to
-# auto-detect the worker's entry point. Wrapping this call in
-# `if __name__ == "__main__":` defeats that scan and triggers the
-# "Could not find runpod.serverless.start() in your default branch"
-# error on the New Endpoint page.
+# Module-level entrypoint — RunPod's GitHub deploy scanner greps for
+# this string at top-level scope to detect the worker's entry point.
 runpod.serverless.start({"handler": handler})
