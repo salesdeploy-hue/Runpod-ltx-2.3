@@ -1,11 +1,11 @@
 {
   "title": "AdsXFlow LTX-2.3 ComfyUI Worker",
-  "description": "ComfyUI-based RunPod Serverless worker running Lightricks LTX-2.3 (22B audio-video) via Lightricks/ComfyUI-LTXVideo. Weights baked into the image (LTX-2.3 distilled fp8 + Gemma 3 12B + spatial upscaler). 32 GB GPU floor — runs on RTX 5090 / L40S / A100 / H100.",
+  "description": "ComfyUI-based RunPod Serverless worker for Lightricks LTX-2.3 (22B audio-video). Slim image + lazy-download weights to /runpod-volume/models on first boot. Attach a 80 GB network volume so weights persist across cold starts.",
   "type": "serverless",
   "category": "video",
   "config": {
     "runpod": "GPU",
-    "containerDiskInGb": 60,
+    "containerDiskInGb": 20,
     "gpuTypeIds": [
       "NVIDIA L40S",
       "NVIDIA A100 80GB PCIe",
@@ -20,13 +20,16 @@
     "workersMin": 0,
     "workersMax": 1,
     "idleTimeout": 30,
-    "executionTimeoutMs": 900000,
+    "executionTimeoutMs": 1200000,
     "flashboot": true,
     "scalerType": "QUEUE_DELAY",
     "scalerValue": 4,
     "env": [
       { "key": "REFRESH_WORKER", "value": "false" },
-      { "key": "HF_HUB_ENABLE_HF_TRANSFER", "value": "0" }
+      { "key": "HF_HUB_ENABLE_HF_TRANSFER", "value": "0" },
+      { "key": "LTX_REPO", "value": "Lightricks/LTX-2.3" },
+      { "key": "LTX_FP8_REPO", "value": "Lightricks/LTX-2.3-fp8" },
+      { "key": "GEMMA_REPO", "value": "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized" }
     ]
   },
   "presets": [
