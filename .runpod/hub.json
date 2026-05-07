@@ -1,31 +1,37 @@
 {
   "title": "AdsXFlow LTX-2.3 Worker",
-  "description": "RunPod Serverless worker for Lightricks LTX-2.3 (22B audio-video). Lazy-loads weights to /runpod-volume/models on first job, then re-uses cached weights across cold starts.",
+  "description": "RunPod Serverless worker for Lightricks LTX-2.3 (22B audio-video). Lazy-loads weights to /runpod-volume/models on first job, persists across cold starts via the attached network volume.",
   "type": "serverless",
   "category": "video",
   "config": {
     "runpod": "GPU",
-    "containerDiskInGb": 20,
+    "containerDiskInGb": 80,
     "gpuTypeIds": [
-      "NVIDIA L40S",
       "NVIDIA A100 80GB PCIe",
-      "NVIDIA H100 80GB HBM3"
+      "NVIDIA H100 80GB HBM3",
+      "NVIDIA A100-SXM4-80GB",
+      "NVIDIA H100 PCIe",
+      "NVIDIA H100 NVL"
     ],
     "gpuCount": 1,
     "workersMin": 0,
     "workersMax": 1,
     "idleTimeout": 30,
-    "executionTimeoutMs": 600000,
+    "executionTimeoutMs": 900000,
     "flashboot": true,
     "scalerType": "QUEUE_DELAY",
     "scalerValue": 4,
     "env": [
-      { "key": "HF_HUB_ENABLE_HF_TRANSFER", "value": "1" },
+      { "key": "HF_HUB_ENABLE_HF_TRANSFER", "value": "0" },
       { "key": "LTX_REPO", "value": "Lightricks/LTX-2.3" },
-      { "key": "GEMMA_REPO", "value": "google/gemma-3-1b-pt" }
+      { "key": "GEMMA_REPO", "value": "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized" },
+      { "key": "LTX_MODELS_ROOT", "value": "/runpod-volume/models" },
+      { "key": "LTX_FALLBACK_MODELS_ROOT", "value": "/workspace/models" },
+      { "key": "PYTORCH_CUDA_ALLOC_CONF", "value": "expandable_segments:True" },
+      { "key": "LTX_OFFLOAD_MODE", "value": "none" }
     ]
   },
   "presets": [
-    { "name": "default", "scale": "L40S" }
+    { "name": "default", "scale": "A100_80GB" }
   ]
 }
