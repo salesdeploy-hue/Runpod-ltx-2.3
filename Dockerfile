@@ -28,18 +28,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # package config invokes `python` in some places).
 RUN ln -sf "$(which python3)" /usr/local/bin/python
 
-RUN python3 -m pip install --upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# Install our worker-side requirements FIRST so a clean torch +
+# diffusers stack lands before LTX-2 is layered on top. Helps avoid
+# dependency-resolution loops where LTX-2's setup.py tries to upgrade
+# torch and breaks the CUDA wheel match.
+COPY requirements.txt /workspace/requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /workspace/requirements.txt
 
 # Clone LTX-2 + install ltx-core + ltx-pipelines from source. Pinned
 # to `main`; bump LTX2_REF after testing a tag.
 ARG LTX2_REF=main
 RUN git clone --depth 1 --branch ${LTX2_REF} https://github.com/Lightricks/LTX-2.git /workspace/LTX-2 \
     && cd /workspace/LTX-2 \
-    && python3 -m pip install --no-cache-dir -e packages/ltx-core \
-    && python3 -m pip install --no-cache-dir -e packages/ltx-pipelines
-
-COPY requirements.txt /workspace/requirements.txt
-RUN python3 -m pip install --no-cache-dir -r /workspace/requirements.txt
+    && python3 -m pip install --no-cache-dir --no-deps -e packages/ltx-core \
+    && python3 -m pip install --no-cache-dir --no-deps -e packages/ltx-pipelines \
+    && echo "✓ ltx packages installed"
 
 COPY handler.py /workspace/handler.py
 
