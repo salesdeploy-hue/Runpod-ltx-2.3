@@ -167,9 +167,13 @@ def _load_pipeline():
             raise RuntimeError(msg)
 
         try:
+            # API rename: older LTX-2 docs called this `distilled_lora`,
+            # current package signature is `loras` (a list of LoRA paths
+            # to stack on top of the base checkpoint). distilled-1.1 is
+            # already merged into the safetensors above, so we pass [].
             _PIPELINE = TI2VidTwoStagesPipeline(
                 checkpoint_path=str(paths["checkpoint"]),
-                distilled_lora=[],  # distilled-1.1 is the merged form
+                loras=[],
                 spatial_upsampler_path=str(paths["spatial_upsampler"]),
                 gemma_root=str(paths["gemma_root"]),
             )
