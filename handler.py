@@ -165,20 +165,46 @@ def _load_pipeline():
             _PIPELINE_LOAD_ERROR = msg
             raise RuntimeError(msg)
 
+        # Pick offload strategy based on GPU VRAM. LTX-2.3 22B bf16
+        # weights = ~44 GB; inference activations need ~10 GB more.
+        # On 48 GB cards (L40S / A40 / RTX A6000) we MUST offload
+        # idle layers to CPU RAM, otherwise we OOM the moment the
+        # second-stage upsampler kicks in. On 80 GB cards (A100 /
+        # H100) we run NONE for max throughput.
+        from ltx_pipelines.utils.types import OffloadMode  # type: ignore
         try:
-            # The TI2VidTwoStagesPipeline signature requires BOTH
-            # `distilled_lora` AND `loras`. We discovered this the
-            # hard way — first error was 'missing loras', then after
-            # adding loras the next error was 'missing distilled_lora'.
-            # distilled-1.1 ships pre-merged into the base safetensors,
-            # so both LoRA lists are empty. Operators stacking
-            # additional adapters can populate `loras` at runtime.
+            vram_gb = (
+                torch.cuda.get_device_properties(0).total_memory
+                / (1024 ** 3) if torch.cuda.is_available() else 0
+            )
+        except Exception:
+            vram_gb = 0
+        offload = (
+            OffloadMode.NONE if vram_gb >= 70 else OffloadMode.CPU
+        )
+        # Operator can force a specific mode via env (e.g. for testing
+        # disk-offload on a tiny GPU); env wins when set.
+        env_offload = (os.environ.get("LTX_OFFLOAD_MODE") or "").strip().lower()
+        if env_offload in {"none", "cpu", "disk"}:
+            offload = OffloadMode(env_offload)
+        print(
+            f"[handler] gpu_vram={vram_gb:.1f}GB → offload_mode={offload.value}",
+            flush=True,
+        )
+
+        try:
+            # TI2VidTwoStagesPipeline signature requires BOTH
+            # `distilled_lora` AND `loras`. distilled-1.1 ships
+            # pre-merged into the base safetensors so both lists are
+            # empty. Operators stacking additional adapters populate
+            # `loras` at runtime.
             _PIPELINE = TI2VidTwoStagesPipeline(
                 checkpoint_path=str(paths["checkpoint"]),
                 distilled_lora=[],
                 loras=[],
                 spatial_upsampler_path=str(paths["spatial_upsampler"]),
                 gemma_root=str(paths["gemma_root"]),
+                offload_mode=offload,
             )
         except Exception as e:
             msg = f"Pipeline construction failed: {type(e).__name__}: {e}"
