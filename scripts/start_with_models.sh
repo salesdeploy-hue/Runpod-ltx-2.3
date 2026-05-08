@@ -19,9 +19,15 @@ echo "[start] applying gemma loader patch (mode=${LOW_VRAM_MODE:-bf16})…"
 /opt/venv/bin/python /usr/local/bin/gemma_loader_patch.py || true
 
 # Step 2 — ensure weights present on /comfyui/models (volume-backed
-# when /runpod-volume is mounted).
+# when /runpod-volume is mounted). FAIL FAST if anything's missing
+# after download — a worker that boots without weights only fails
+# later at workflow validation, where the error message is opaque.
 echo "[start] running model ensure step…"
-/opt/venv/bin/python /usr/local/bin/ensure_models.py || true
+if ! /opt/venv/bin/python /usr/local/bin/ensure_models.py; then
+  echo "[start] ✗ model ensure step failed — aborting boot. Check the"
+  echo "[start]   download errors above (gated repo? bad HF_TOKEN? volume full?)"
+  exit 1
+fi
 
 # Step 3 — augment ComfyUI args. worker-comfyui's /start.sh uses
 # COMFY_ARGS verbatim, so we append rather than replace.

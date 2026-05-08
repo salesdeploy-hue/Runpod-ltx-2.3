@@ -19,16 +19,12 @@ from pathlib import Path
 
 LTX_FP8_REPO = os.environ.get("LTX_FP8_REPO", "Lightricks/LTX-2.3-fp8")
 LTX_REPO = os.environ.get("LTX_REPO", "Lightricks/LTX-2.3")
-# Default GEMMA_REPO is the QAT-Q4 weights (~7GB). The -unquantized
-# variant (~24GB at bf16) is only used when LOW_VRAM_MODE=bf16 is set
-# explicitly as an emergency rollback.
+# Public, pre-quantized bnb-4bit Gemma. ~7GB on disk, ~7GB VRAM at
+# runtime via bitsandbytes auto-engaged from the model's config.json.
+# Lightricks's own Q4 repo is gated on HF; unsloth's mirror is public.
 GEMMA_REPO = os.environ.get(
-    "GEMMA_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0"
+    "GEMMA_REPO", "unsloth/gemma-3-12b-it-bnb-4bit"
 )
-GEMMA_BF16_REPO = os.environ.get(
-    "GEMMA_BF16_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
-)
-LOW_VRAM_MODE = (os.environ.get("LOW_VRAM_MODE") or "q4").lower().strip()
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 
 COMFY_ROOT = Path("/comfyui")
@@ -131,76 +127,95 @@ def _download_required(models_root: Path) -> None:
 
 
 def _download_gemma(models_root: Path) -> None:
-    """Download whichever Gemma variant matches LOW_VRAM_MODE.
-
-    - bf16 (default): ``-unquantized`` snapshot, ~24 GB. The QAT-Q4
-      weights baked back into bf16 — what LTXVGemmaCLIPModelLoader
-      loads natively. Use on 32GB+ cards.
-    - q4: ``-qat-q4_0`` snapshot, ~7 GB. Quantization-aware-trained
-      Q4 weights. Loaded via bitsandbytes int4 thanks to the
-      gemma_loader_patch monkey-patch. Experimental — for 24GB cards.
-
-    Both land at the same path so the workflow builder's
-    ``gemma_path`` doesn't need to change between modes.
-    """
+    """Download Gemma encoder. Default is unsloth's public bnb-4bit
+    snapshot (~7GB). Auto-quantizes via bitsandbytes when transformers
+    loads the model — no monkey-patch required."""
     from huggingface_hub import snapshot_download  # type: ignore
 
-    # Default LOW_VRAM_MODE is q4 → Lightricks/gemma-3-12b-it-qat-q4_0
-    # (true Q4 weights, ~7GB). bf16 path uses the -unquantized variant
-    # (24GB) only as an emergency override.
-    repo = GEMMA_BF16_REPO if LOW_VRAM_MODE == "bf16" else GEMMA_REPO
     gemma_dir = models_root / "text_encoders" / "gemma-3-12b"
     marker = gemma_dir / "preprocessor_config.json"
-    mode_marker = gemma_dir / f".mode-{LOW_VRAM_MODE}"
-    if marker.exists() and mode_marker.exists():
+    repo_marker = gemma_dir / f".repo-{GEMMA_REPO.replace('/', '_')}"
+
+    if marker.exists() and repo_marker.exists():
         print(
             f"[ensure_models] ✓ cached: text_encoders/gemma-3-12b/ "
-            f"(mode={LOW_VRAM_MODE})",
+            f"(repo={GEMMA_REPO})",
             flush=True,
         )
         return
 
-    # If the cached Gemma is for a DIFFERENT mode, blow it away —
-    # bf16 and q4 weights have different file layouts and mixing them
-    # confuses the loader's recursive globbing for tokenizer.model.
-    if marker.exists() and not mode_marker.exists():
+    # If a different repo's snapshot is cached, wipe it first — file
+    # layouts differ and Lightricks's loader does a recursive glob,
+    # which would pick up wrong files.
+    if marker.exists() and not repo_marker.exists():
         print(
-            f"[ensure_models] cached Gemma is wrong mode (have other, "
-            f"want {LOW_VRAM_MODE}) — re-downloading",
+            f"[ensure_models] cached Gemma is from a different repo — "
+            f"re-downloading from {GEMMA_REPO}",
             flush=True,
         )
         import shutil as _shutil
         _shutil.rmtree(gemma_dir, ignore_errors=True)
 
     gemma_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[ensure_models] downloading {repo} → {gemma_dir}", flush=True)
+    print(f"[ensure_models] downloading {GEMMA_REPO} → {gemma_dir}", flush=True)
     t0 = time.time()
     snapshot_download(
-        repo_id=repo,
+        repo_id=GEMMA_REPO,
         local_dir=str(gemma_dir),
         token=HF_TOKEN,
     )
-    mode_marker.touch()
+    repo_marker.touch()
     print(f"[ensure_models] gemma done in {time.time() - t0:.0f}s", flush=True)
 
 
 def main() -> int:
+    """Ensure all weights are present. Exits non-zero if any required
+    file is missing AFTER all downloads attempted, so the worker boot
+    aborts loudly instead of silently starting ComfyUI with an empty
+    text_encoders dir (the failure mode that bit us on 2026-05-08:
+    gated repo download failed silently → workflow validation later
+    rejected an empty gemma_path filename list)."""
+    download_err: Exception | None = None
     try:
         root = _redirect_models_to_volume()
         _download_required(root)
         _download_gemma(root)
-        print("[ensure_models] all weights present", flush=True)
-        return 0
     except Exception as e:  # noqa: BLE001
-        # Don't bail the worker boot — log loudly. ComfyUI will surface
-        # a clear "checkpoint not found" error on the first /run if a
-        # weight is missing, which is recoverable by re-running.
+        download_err = e
         print(
-            f"[ensure_models] ⚠ failed (continuing anyway): "
+            f"[ensure_models] ⚠ download error: "
             f"{type(e).__name__}: {e}",
             flush=True,
         )
-        return 0
+
+    # Verify every required file actually landed. If any are missing
+    # we exit non-zero so start_with_models.sh fails fast — far
+    # better than booting ComfyUI to handle a request it can't fulfil.
+    missing: list[str] = []
+    for spec in REQUIRED:
+        target = root / spec["subdir"] / spec["filename"]
+        if not _file_complete(target, spec["min_bytes"]):
+            missing.append(f"{spec['subdir']}/{spec['filename']}")
+    gemma_marker = root / "text_encoders" / "gemma-3-12b" / "preprocessor_config.json"
+    if not gemma_marker.exists():
+        missing.append("text_encoders/gemma-3-12b/preprocessor_config.json")
+
+    if missing:
+        print(
+            f"[ensure_models] ✗ ABORT: required files missing after download: "
+            f"{', '.join(missing)}",
+            flush=True,
+        )
+        if download_err:
+            print(
+                f"[ensure_models] root cause: {type(download_err).__name__}: "
+                f"{download_err}",
+                flush=True,
+            )
+        return 1
+
+    print("[ensure_models] ✓ all weights present", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

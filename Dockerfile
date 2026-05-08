@@ -59,18 +59,20 @@ CMD ["/usr/local/bin/start_with_models.sh"]
 # ─── Worker config ─────────────────────────────────────────────────────
 # Everything ships QUANTIZED by default:
 #   - LTX 2.3 → fp8 distilled (~22GB on disk, ~35GB peak VRAM)
-#   - Gemma 3 12B → QAT-Q4 weights loaded as nf4 via bitsandbytes
-#     (~7GB VRAM instead of ~24GB at bf16)
-# bf16 path stays available for emergency rollback (set LOW_VRAM_MODE=bf16
-# and GEMMA_REPO back to the -unquantized repo) but it is NOT the default.
+#   - Gemma 3 12B → unsloth bnb-4bit (~7GB on disk, ~7GB VRAM)
+#
+# Unsloth's bnb-4bit safetensors include a quantization_config in the
+# model's config.json, so HF transformers' Gemma3ForConditionalGeneration
+# .from_pretrained engages bitsandbytes automatically — no monkey-patch
+# needed (we keep the patch script for legacy LOW_VRAM_MODE=q4 paths
+# but it's a no-op now).
+#
+# Lightricks/* gemma repos are GATED on HF (manual approval). Unsloth's
+# repos are PUBLIC. That's why we use unsloth.
 ENV REFRESH_WORKER=false \
     HF_HUB_ENABLE_HF_TRANSFER=0 \
     LTX_REPO=Lightricks/LTX-2.3 \
     LTX_FP8_REPO=Lightricks/LTX-2.3-fp8 \
-    GEMMA_REPO=Lightricks/gemma-3-12b-it-qat-q4_0 \
-    GEMMA_BF16_REPO=Lightricks/gemma-3-12b-it-qat-q4_0-unquantized \
+    GEMMA_REPO=unsloth/gemma-3-12b-it-bnb-4bit \
     LOW_VRAM_MODE=q4 \
-    # ComfyUI startup args. --reserve-vram leaves headroom for VAE/UI;
-    # values <5 risk OOM near job end. Can override via env at endpoint
-    # config time.
     COMFY_RESERVE_VRAM=5
