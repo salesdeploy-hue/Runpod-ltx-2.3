@@ -19,13 +19,16 @@ from pathlib import Path
 
 LTX_FP8_REPO = os.environ.get("LTX_FP8_REPO", "Lightricks/LTX-2.3-fp8")
 LTX_REPO = os.environ.get("LTX_REPO", "Lightricks/LTX-2.3")
+# Default GEMMA_REPO is the QAT-Q4 weights (~7GB). The -unquantized
+# variant (~24GB at bf16) is only used when LOW_VRAM_MODE=bf16 is set
+# explicitly as an emergency rollback.
 GEMMA_REPO = os.environ.get(
-    "GEMMA_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
+    "GEMMA_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0"
 )
-GEMMA_Q4_REPO = os.environ.get(
-    "GEMMA_Q4_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0"
+GEMMA_BF16_REPO = os.environ.get(
+    "GEMMA_BF16_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
 )
-LOW_VRAM_MODE = (os.environ.get("LOW_VRAM_MODE") or "bf16").lower().strip()
+LOW_VRAM_MODE = (os.environ.get("LOW_VRAM_MODE") or "q4").lower().strip()
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 
 COMFY_ROOT = Path("/comfyui")
@@ -142,7 +145,10 @@ def _download_gemma(models_root: Path) -> None:
     """
     from huggingface_hub import snapshot_download  # type: ignore
 
-    repo = GEMMA_Q4_REPO if LOW_VRAM_MODE == "q4" else GEMMA_REPO
+    # Default LOW_VRAM_MODE is q4 → Lightricks/gemma-3-12b-it-qat-q4_0
+    # (true Q4 weights, ~7GB). bf16 path uses the -unquantized variant
+    # (24GB) only as an emergency override.
+    repo = GEMMA_BF16_REPO if LOW_VRAM_MODE == "bf16" else GEMMA_REPO
     gemma_dir = models_root / "text_encoders" / "gemma-3-12b"
     marker = gemma_dir / "preprocessor_config.json"
     mode_marker = gemma_dir / f".mode-{LOW_VRAM_MODE}"

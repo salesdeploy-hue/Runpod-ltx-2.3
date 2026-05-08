@@ -23,7 +23,7 @@ import sys
 
 logger = logging.getLogger(__name__)
 
-_LOW_VRAM_MODE = (os.environ.get("LOW_VRAM_MODE") or "bf16").lower().strip()
+_LOW_VRAM_MODE = (os.environ.get("LOW_VRAM_MODE") or "q4").lower().strip()
 
 
 def _apply_patch() -> None:
