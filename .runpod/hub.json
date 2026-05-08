@@ -1,6 +1,6 @@
 {
-  "title": "AdsXFlow LTX-2.3 ComfyUI Worker",
-  "description": "ComfyUI-based RunPod Serverless worker for Lightricks LTX-2.3 (22B audio-video). Slim image + lazy-download weights to /runpod-volume/models on first boot. Attach a 80 GB network volume so weights persist across cold starts.",
+  "title": "AdsXFlow LTX-2.3 ComfyUI Worker (Q4)",
+  "description": "ComfyUI-based RunPod Serverless worker for Lightricks LTX-2.3. Fully quantized stack: LTX 2.3 fp8 + Gemma 3 12B QAT-Q4 (loaded as nf4 via bitsandbytes). Slim image + lazy-download weights to /runpod-volume/models on first boot. Attach a 40 GB network volume so weights persist across cold starts. Targets 32GB+ VRAM (RTX 5000 Ada / RTX 5090 / L40S / A100 80GB); 24GB experimental.",
   "type": "serverless",
   "category": "video",
   "config": {
@@ -10,15 +10,13 @@
       "NVIDIA L40S",
       "NVIDIA A100 80GB PCIe",
       "NVIDIA A100-SXM4-80GB",
-      "NVIDIA H100 80GB HBM3",
-      "NVIDIA H100 PCIe",
       "NVIDIA RTX PRO 6000 Blackwell Server Edition",
       "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
       "NVIDIA GeForce RTX 5090"
     ],
     "gpuCount": 1,
     "workersMin": 0,
-    "workersMax": 1,
+    "workersMax": 3,
     "idleTimeout": 30,
     "executionTimeoutMs": 1200000,
     "flashboot": true,
@@ -29,7 +27,10 @@
       { "key": "HF_HUB_ENABLE_HF_TRANSFER", "value": "0" },
       { "key": "LTX_REPO", "value": "Lightricks/LTX-2.3" },
       { "key": "LTX_FP8_REPO", "value": "Lightricks/LTX-2.3-fp8" },
-      { "key": "GEMMA_REPO", "value": "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized" }
+      { "key": "GEMMA_REPO", "value": "Lightricks/gemma-3-12b-it-qat-q4_0" },
+      { "key": "GEMMA_BF16_REPO", "value": "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized" },
+      { "key": "LOW_VRAM_MODE", "value": "q4" },
+      { "key": "COMFY_RESERVE_VRAM", "value": "5" }
     ]
   },
   "presets": [
