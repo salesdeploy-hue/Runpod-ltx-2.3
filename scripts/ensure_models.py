@@ -22,6 +22,10 @@ LTX_REPO = os.environ.get("LTX_REPO", "Lightricks/LTX-2.3")
 GEMMA_REPO = os.environ.get(
     "GEMMA_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
 )
+GEMMA_Q4_REPO = os.environ.get(
+    "GEMMA_Q4_REPO", "Lightricks/gemma-3-12b-it-qat-q4_0"
+)
+LOW_VRAM_MODE = (os.environ.get("LOW_VRAM_MODE") or "bf16").lower().strip()
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 
 COMFY_ROOT = Path("/comfyui")
@@ -124,23 +128,53 @@ def _download_required(models_root: Path) -> None:
 
 
 def _download_gemma(models_root: Path) -> None:
+    """Download whichever Gemma variant matches LOW_VRAM_MODE.
+
+    - bf16 (default): ``-unquantized`` snapshot, ~24 GB. The QAT-Q4
+      weights baked back into bf16 — what LTXVGemmaCLIPModelLoader
+      loads natively. Use on 32GB+ cards.
+    - q4: ``-qat-q4_0`` snapshot, ~7 GB. Quantization-aware-trained
+      Q4 weights. Loaded via bitsandbytes int4 thanks to the
+      gemma_loader_patch monkey-patch. Experimental — for 24GB cards.
+
+    Both land at the same path so the workflow builder's
+    ``gemma_path`` doesn't need to change between modes.
+    """
     from huggingface_hub import snapshot_download  # type: ignore
 
+    repo = GEMMA_Q4_REPO if LOW_VRAM_MODE == "q4" else GEMMA_REPO
     gemma_dir = models_root / "text_encoders" / "gemma-3-12b"
     marker = gemma_dir / "preprocessor_config.json"
-    if marker.exists():
+    mode_marker = gemma_dir / f".mode-{LOW_VRAM_MODE}"
+    if marker.exists() and mode_marker.exists():
         print(
-            f"[ensure_models] ✓ cached: text_encoders/gemma-3-12b/", flush=True,
+            f"[ensure_models] ✓ cached: text_encoders/gemma-3-12b/ "
+            f"(mode={LOW_VRAM_MODE})",
+            flush=True,
         )
         return
+
+    # If the cached Gemma is for a DIFFERENT mode, blow it away —
+    # bf16 and q4 weights have different file layouts and mixing them
+    # confuses the loader's recursive globbing for tokenizer.model.
+    if marker.exists() and not mode_marker.exists():
+        print(
+            f"[ensure_models] cached Gemma is wrong mode (have other, "
+            f"want {LOW_VRAM_MODE}) — re-downloading",
+            flush=True,
+        )
+        import shutil as _shutil
+        _shutil.rmtree(gemma_dir, ignore_errors=True)
+
     gemma_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[ensure_models] downloading {GEMMA_REPO} → {gemma_dir}", flush=True)
+    print(f"[ensure_models] downloading {repo} → {gemma_dir}", flush=True)
     t0 = time.time()
     snapshot_download(
-        repo_id=GEMMA_REPO,
+        repo_id=repo,
         local_dir=str(gemma_dir),
         token=HF_TOKEN,
     )
+    mode_marker.touch()
     print(f"[ensure_models] gemma done in {time.time() - t0:.0f}s", flush=True)
 
 
